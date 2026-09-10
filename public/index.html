@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Insufficiency Reminders</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Insufficiency Reminders</h1>
+    <p class="subtitle">Track candidates with pending BGV insufficiencies and send reminders.</p>
+    <div class="toolbox" style="display:flex;gap:8px;margin-top:8px;">
+      <button id="reset-btn" type="button" title="Utility: resets sample data, not part of the app under test" style="padding:4px 10px;border:1px solid #ccc;border-radius:4px;background:#fff;cursor:pointer;">↺ Reset data</button>
+      <a id="spec-link" href="/spec" target="_blank" title="Utility: opens the spec, not part of the app under test" style="padding:4px 10px;border:1px solid #ccc;border-radius:4px;background:#fff;text-decoration:none;color:#1a1a1a;">📋 Spec</a>
+      <a class="header-btn" href="/openapi.json" target="_blank" title="Utility: OpenAPI collection, not part of the app under test" style="padding:4px 10px;border:1px solid #ccc;border-radius:4px;background:#fff;text-decoration:none;color:#1a1a1a;">📥 API collection</a>
+    </div>
+  </header>
+
+  <div id="app-section">
+    <main>
+      <section class="panel">
+        <h2>Add Insufficiency</h2>
+        <form id="add-form">
+          <input type="text" id="candidate-name" placeholder="Candidate name" />
+          <input type="text" id="reason" placeholder="Reason" />
+          <button type="submit">Add</button>
+        </form>
+        <div id="add-message" class="message"></div>
+      </section>
+
+      <section class="panel">
+        <div class="list-header">
+          <h2>Insufficiencies</h2>
+          <select id="status-filter">
+            <option value="">All</option>
+            <option value="OPEN">OPEN</option>
+            <option value="RESOLVED">RESOLVED</option>
+          </select>
+        </div>
+        <table id="insuff-table">
+          <thead>
+            <tr>
+              <th>Candidate</th>
+              <th>Reason</th>
+              <th>Status</th>
+              <th>Reminders</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="insuff-body"></tbody>
+        </table>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+  <script>window.SV_APP_ID='05';window.SV_SCOREBOARD='https://sv-qa-scoreboard.onrender.com';</script>
+  <script src="report-widget.js"></script>
+</body>
+</html>
