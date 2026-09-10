@@ -3,188 +3,472 @@ const path = require("path");
 
 const PORT = process.env.PORT || 3005;
 
-// ---- Fix-track gate: hide /spec once Phase 2 (Fix Track) opens ----
-// Polls the scoreboard's public flag, cached ~20s. ponytail: fail-open — if the
-// scoreboard is unreachable we keep the spec visible so a blip never breaks Phase 1.
-const SCOREBOARD_URL = (process.env.SCOREBOARD_URL || 'https://sv-qa-scoreboard.onrender.com').replace(/\/+$/, '');
-let _ftCache = { open: false, at: 0 };
-async function fixTrackOpen() {
-  if (typeof fetch !== 'function') return false;
-  if (Date.now() - _ftCache.at < 20000) return _ftCache.open;
+// -----------------------------------------------------------------------------
+// Fix-track gate
+// -----------------------------------------------------------------------------
+// The /spec endpoint is hidden once Phase 2 opens. The scoreboard state is
+// cached briefly so a temporary scoreboard failure does not affect the app.
+const SCOREBOARD_URL = (
+  process.env.SCOREBOARD_URL ||
+  "https://sv-qa-scoreboard.onrender.com"
+).replace(/\/+$/, "");
+
+let fixTrackCache = {
+  open: false,
+  timestamp: 0,
+};
+
+async function isFixTrackOpen() {
+  if (typeof fetch !== "function") {
+    return false;
+  }
+
+  if (Date.now() - fixTrackCache.timestamp < 20000) {
+    return fixTrackCache.open;
+  }
+
   try {
-    const r = await fetch(SCOREBOARD_URL + '/api/fix-track');
-    const j = await r.json();
-    _ftCache = { open: j && j.open === true, at: Date.now() };
-  } catch (e) { /* keep last value; default closed = spec visible */ }
-  return _ftCache.open;
+    const response = await fetch(`${SCOREBOARD_URL}/api/fix-track`);
+    const data = await response.json();
+
+    fixTrackCache = {
+      open: data && data.open === true,
+      timestamp: Date.now(),
+    };
+  } catch (error) {
+    // Keep the previous state if the scoreboard cannot be reached.
+  }
+
+  return fixTrackCache.open;
 }
 
 const app = express();
 
-// ---- CORS: allow cross-origin API testing (Hoppscotch web, Postman web, etc.) ----
+
+// -----------------------------------------------------------------------------
+// CORS
+// -----------------------------------------------------------------------------
+
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization');
-  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header(
+    "Access-Control-Allow-Methods",
+    "GET,POST,PUT,PATCH,DELETE,OPTIONS"
+  );
+  res.header(
+    "Access-Control-Allow-Headers",
+    "Content-Type,Authorization"
+  );
+
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204);
+  }
+
   next();
 });
 
-// ---- Access gate: HTTP Basic Auth. Disabled unless ACCESS_PASSWORD is set. Rotate/clear
-// ACCESS_PASSWORD in the Render dashboard to make the link dead instantly (env var change
-// auto-redeploys). Share as https://<any-username>:<password>@<host>/ for a one-click link. ----
+
+// -----------------------------------------------------------------------------
+// Optional HTTP Basic Authentication
+// -----------------------------------------------------------------------------
+
 const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD || null;
+
 app.use((req, res, next) => {
-  if (!ACCESS_PASSWORD) return next();
-  const header = req.headers.authorization || '';
-  const [scheme, encoded] = header.split(' ');
-  const decoded = encoded ? Buffer.from(encoded, 'base64').toString() : '';
-  const pass = decoded.split(':')[1];
-  if (scheme !== 'Basic' || pass !== ACCESS_PASSWORD) {
-    res.set('WWW-Authenticate', 'Basic realm="SV QA Challenge"');
-    return res.status(401).send('Auth required. Ask the interviewer for the link.');
+  if (!ACCESS_PASSWORD) {
+    return next();
   }
+
+  const authorization = req.headers.authorization || "";
+  const [scheme, encodedCredentials] = authorization.split(" ");
+
+  const decodedCredentials = encodedCredentials
+    ? Buffer.from(encodedCredentials, "base64").toString()
+    : "";
+
+  const password = decodedCredentials.split(":")[1];
+
+  if (scheme !== "Basic" || password !== ACCESS_PASSWORD) {
+    res.set(
+      "WWW-Authenticate",
+      'Basic realm="SV QA Challenge"'
+    );
+
+    return res
+      .status(401)
+      .send("Auth required. Ask the interviewer for the link.");
+  }
+
   next();
 });
+
+
+// -----------------------------------------------------------------------------
+// Application setup
+// -----------------------------------------------------------------------------
 
 app.use(express.json());
-const { perStudentStore } = require('./isolation');
-const { makeSeed } = require('./data');
+
+const { perStudentStore } = require("./isolation");
+const { makeSeed } = require("./data");
+
 app.use(perStudentStore(makeSeed));
 app.use(express.static(path.join(__dirname, "public")));
 
 const REMINDER_CAP = 3;
 
+
+// ============================================================================
+// GET /api/insufficiencies
+// ============================================================================
+
 app.get("/api/insufficiencies", (req, res) => {
   const { status } = req.query;
-  if (!status) return res.json(req.store.insufficiencies);
-  const result = req.store.insufficiencies.filter((i) => i.status.toLowerCase() === status);
+
+  if (!status) {
+    return res.json(req.store.insufficiencies);
+  }
+
+  // The API accepts status values without requiring a particular case.
+  // Normalising both values prevents "RESOLVED" and "resolved" from
+  // producing different results.
+  const normalizedStatus = status.toLowerCase();
+
+  const result = req.store.insufficiencies.filter(
+    (item) => item.status.toLowerCase() === normalizedStatus
+  );
+
   res.json(result);
 });
 
+
+// ============================================================================
+// POST /api/insufficiencies
+// ============================================================================
+
 app.post("/api/insufficiencies", (req, res) => {
   const { candidateName, reason } = req.body;
-  // BUG (Hard, state/sequence): nextId is burned here for an audit-log id
-  // that was never wired up, then burned AGAIN below for the real id —
-  // every create burns an extra id, so ids skip a number every other call
-  // (e.g. 4, 6, 8, ... instead of 4, 5, 6, ...).
+
+  // Both fields are required and must contain meaningful string values.
+  // This prevents incomplete or whitespace-only records from entering
+  // the application state.
+  if (
+    typeof candidateName !== "string" ||
+    typeof reason !== "string" ||
+    candidateName.trim() === "" ||
+    reason.trim() === ""
+  ) {
+    return res.status(400).json({
+      error: "candidateName and reason are required",
+    });
+  }
+
+  // Kept unchanged from the supplied application. This audit ID is currently
+  // reserved even though the audit log is not wired into the application.
   const auditId = req.store.nextId++;
+
   const item = {
     id: req.store.nextId++,
     candidateName,
     reason,
     status: "OPEN",
     createdAt: new Date().toISOString(),
-    reminderCount: 1
+
+    // A newly created insufficiency has not received any reminders yet.
+    reminderCount: 0,
   };
+
   req.store.insufficiencies.push(item);
+
   res.status(201).json(item);
 });
 
-app.post("/api/insufficiencies/:id/remind", (req, res) => {
-  const item = req.store.insufficiencies.find((i) => i.id === Number(req.params.id));
 
-  if (item.reminderCount > REMINDER_CAP) {
-    return res.status(400).json({ error: "Cannot send more reminders" });
+// ============================================================================
+// POST /api/insufficiencies/:id/remind
+// ============================================================================
+
+app.post("/api/insufficiencies/:id/remind", (req, res) => {
+  const item = req.store.insufficiencies.find(
+    (entry) => entry.id === Number(req.params.id)
+  );
+
+  // A missing record is a client-visible "not found" condition rather than
+  // an application error.
+  if (!item) {
+    return res.status(404).json({
+      error: "Insufficiency not found",
+    });
+  }
+
+  // Reminders only apply to active insufficiencies. Once the record has been
+  // resolved, sending another reminder is no longer a valid operation.
+  if (item.status === "RESOLVED") {
+    return res.status(400).json({
+      error: "Cannot remind a resolved insufficiency",
+    });
+  }
+
+  // The cap represents the maximum number of reminders that may be stored.
+  // Checking >= before incrementing prevents a fourth reminder from being
+  // created when the current count is already 3.
+  if (item.reminderCount >= REMINDER_CAP) {
+    return res.status(400).json({
+      error: "Reminder cap reached",
+    });
   }
 
   item.reminderCount += 1;
-  const responseCount = item.reminderCount - 1;
 
+  // Return the same updated value that has been persisted in the store.
+  // This keeps the API response consistent with subsequent GET requests.
   res.json({
     id: item.id,
     candidateName: item.candidateName,
     status: item.status,
-    reminderCount: responseCount
+    reminderCount: item.reminderCount,
   });
 });
 
+
+// ============================================================================
+// PATCH /api/insufficiencies/:id/resolve
+// ============================================================================
+
 app.patch("/api/insufficiencies/:id/resolve", (req, res) => {
-  const item = req.store.insufficiencies.find((i) => i.id === Number(req.params.id));
-  if (item) {
-    item.status = "RESOLVED";
+  const item = req.store.insufficiencies.find(
+    (entry) => entry.id === Number(req.params.id)
+  );
+
+  // Resolving a record that does not exist should return a proper
+  // resource-not-found response.
+  if (!item) {
+    return res.status(404).json({
+      error: "Insufficiency not found",
+    });
   }
+
+  item.status = "RESOLVED";
+
+  // Preserve the original response contract used by the application.
   res.json(req.store.insufficiencies);
 });
 
-// --- Tooling: reset + spec (utilities only, not part of the app under test) ---
+
+// ============================================================================
+// Test/reset utility
+// ============================================================================
 
 app.post("/api/reset", (req, res) => {
   req.resetStore();
-  res.json({ ok: true });
+
+  res.json({
+    ok: true,
+  });
 });
 
+
+// ============================================================================
+// Spec rendering helpers
+// ============================================================================
+
 function escapeHtml(str) {
-  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
-// ---- Spec page: render this app's README.md as styled HTML (no external deps) ----
 function renderMarkdown(md) {
-  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const inline = (s) =>
-    esc(s)
-      .replace(/`([^`]+)`/g, '<code>$1</code>')
-      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-      .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2">$1</a>');
-  const lines = md.split('\n');
-  const out = [];
-  let i = 0;
-  const flushList = (buf, tag) => {
-    if (buf.length) {
-      out.push('<' + tag + '>' + buf.map((x) => '<li>' + inline(x) + '</li>').join('') + '</' + tag + '>');
-      buf.length = 0;
+  const esc = (value) =>
+    value
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+
+  const inline = (value) =>
+    esc(value)
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\*\*([^\*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(
+        /\[([^\]]+)\]\(([^)]+)\)/g,
+        '<a href="$2">$1</a>'
+      );
+
+  const lines = md.split("\n");
+  const output = [];
+
+  let index = 0;
+
+  const flushList = (buffer, tag) => {
+    if (buffer.length) {
+      output.push(
+        `<${tag}>` +
+          buffer
+            .map((item) => `<li>${inline(item)}</li>`)
+            .join("") +
+          `</${tag}>`
+      );
+
+      buffer.length = 0;
     }
   };
-  while (i < lines.length) {
-    const line = lines[i];
+
+  while (index < lines.length) {
+    const line = lines[index];
     const fence = line.match(/^```(\w*)/);
+
     if (fence) {
       const code = [];
-      i++;
-      while (i < lines.length && !/^```/.test(lines[i])) { code.push(lines[i]); i++; }
-      i++;
-      out.push('<pre><code>' + esc(code.join('\n')) + '</code></pre>');
-      continue;
-    }
-    if (/^\s*\|.*\|\s*$/.test(line) && i + 1 < lines.length && /-/.test(lines[i + 1]) && /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[i + 1])) {
-      const cells = (r) => r.trim().replace(/^\||\|$/g, '').split('|').map((c) => c.trim());
-      const header = cells(line);
-      i += 2;
-      let t = '<table><thead><tr>' + header.map((h) => '<th>' + inline(h) + '</th>').join('') + '</tr></thead><tbody>';
-      while (i < lines.length && /^\s*\|.*\|\s*$/.test(lines[i])) {
-        t += '<tr>' + cells(lines[i]).map((c) => '<td>' + inline(c) + '</td>').join('') + '</tr>';
-        i++;
+
+      index++;
+
+      while (
+        index < lines.length &&
+        !/^```/.test(lines[index])
+      ) {
+        code.push(lines[index]);
+        index++;
       }
-      out.push(t + '</tbody></table>');
+
+      index++;
+
+      output.push(
+        `<pre><code>${esc(code.join("\n"))}</code></pre>`
+      );
+
       continue;
     }
-    const h = line.match(/^(#{1,6})\s+(.*)$/);
-    if (h) { out.push('<h' + h[1].length + '>' + inline(h[2]) + '</h' + h[1].length + '>'); i++; continue; }
-    if (/^---+$/.test(line.trim())) { out.push('<hr>'); i++; continue; }
+
+    if (
+      /^\s*\|.*\|\s*$/.test(line) &&
+      index + 1 < lines.length &&
+      /-/.test(lines[index + 1]) &&
+      /^\s*\|?[\s:|-]+\|?\s*$/.test(lines[index + 1])
+    ) {
+      const cells = (row) =>
+        row
+          .trim()
+          .replace(/^\||\|$/g, "")
+          .split("|")
+          .map((cell) => cell.trim());
+
+      const header = cells(line);
+
+      index += 2;
+
+      let table =
+        "<table><thead><tr>" +
+        header
+          .map((cell) => `<th>${inline(cell)}</th>`)
+          .join("") +
+        "</tr></thead><tbody>";
+
+      while (
+        index < lines.length &&
+        /^\s*\|.*\|\s*$/.test(lines[index])
+      ) {
+        table +=
+          "<tr>" +
+          cells(lines[index])
+            .map((cell) => `<td>${inline(cell)}</td>`)
+            .join("") +
+          "</tr>";
+
+        index++;
+      }
+
+      output.push(table + "</tbody></table>");
+
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+
+    if (heading) {
+      const level = heading[1].length;
+
+      output.push(
+        `<h${level}>${inline(heading[2])}</h${level}>`
+      );
+
+      index++;
+      continue;
+    }
+
+    if (/^---+$/.test(line.trim())) {
+      output.push("<hr>");
+      index++;
+      continue;
+    }
+
     if (/^\s*[-*]\s+/.test(line)) {
-      const buf = [];
-      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) { buf.push(lines[i].replace(/^\s*[-*]\s+/, '')); i++; }
-      flushList(buf, 'ul');
+      const buffer = [];
+
+      while (
+        index < lines.length &&
+        /^\s*[-*]\s+/.test(lines[index])
+      ) {
+        buffer.push(
+          lines[index].replace(/^\s*[-*]\s+/, "")
+        );
+
+        index++;
+      }
+
+      flushList(buffer, "ul");
       continue;
     }
+
     if (/^\s*\d+\.\s+/.test(line)) {
-      const buf = [];
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) { buf.push(lines[i].replace(/^\s*\d+\.\s+/, '')); i++; }
-      flushList(buf, 'ol');
+      const buffer = [];
+
+      while (
+        index < lines.length &&
+        /^\s*\d+\.\s+/.test(lines[index])
+      ) {
+        buffer.push(
+          lines[index].replace(/^\s*\d+\.\s+/, "")
+        );
+
+        index++;
+      }
+
+      flushList(buffer, "ol");
       continue;
     }
-    if (line.trim() === '') { i++; continue; }
-    const para = [];
+
+    if (line.trim() === "") {
+      index++;
+      continue;
+    }
+
+    const paragraph = [];
+
     while (
-      i < lines.length &&
-      lines[i].trim() !== '' &&
-      !/^(#{1,6}\s|```|\s*[-*]\s|\s*\d+\.\s)/.test(lines[i]) &&
-      !/^\s*\|.*\|\s*$/.test(lines[i])
-    ) { para.push(lines[i]); i++; }
-    out.push('<p>' + inline(para.join(' ')) + '</p>');
+      index < lines.length &&
+      lines[index].trim() !== "" &&
+      !/^(#{1,6}\s|```|\s*[-*]\s|\s*\d+\.\s)/.test(
+        lines[index]
+      ) &&
+      !/^\s*\|.*\|\s*$/.test(lines[index])
+    ) {
+      paragraph.push(lines[index]);
+      index++;
+    }
+
+    output.push(
+      `<p>${inline(paragraph.join(" "))}</p>`
+    );
   }
-  return out.join('\n');
+
+  return output.join("\n");
 }
+
+
+// ============================================================================
+// Spec page styling
+// ============================================================================
 
 const SPEC_CSS = `
 :root{color-scheme:light dark}
@@ -217,113 +501,263 @@ hr{border:0;border-top:1px solid #e3e6ea;margin:2em 0}
  tr:nth-child(even) td{background:#0f141a}
  hr{border-color:#21262d}
  .back,a{color:#4c9ffe}
-}`;
+}
+`;
+
+
+// ============================================================================
+// Spec endpoint
+// ============================================================================
 
 function reqBaseUrl(req) {
-  const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
-  return proto + '://' + req.get('host');
+  const protocol =
+    req.headers["x-forwarded-proto"] ||
+    req.protocol ||
+    "http";
+
+  return `${protocol}://${req.get("host")}`;
 }
 
-app.get('/spec', async (req, res) => {
-  if (await fixTrackOpen()) {
+app.get("/spec", async (req, res) => {
+  if (await isFixTrackOpen()) {
     return res
       .status(403)
-      .type('html')
-      .send('<!doctype html><meta charset="utf-8"><body style="font-family:system-ui,sans-serif;max-width:640px;margin:64px auto;padding:0 20px;line-height:1.6"><h2>Spec unavailable during Phase 2</h2><p>The spec is hidden now that the Fix Track is open. Use the app itself and your downloaded bug report to write your tests.</p><p><a href="/">&larr; Back to app</a></p></body>');
+      .type("html")
+      .send(
+        '<!doctype html><meta charset="utf-8">' +
+          '<body style="font-family:system-ui,sans-serif;max-width:640px;margin:64px auto;padding:0 20px;line-height:1.6">' +
+          "<h2>Spec unavailable during Phase 2</h2>" +
+          "<p>The spec is hidden now that the Fix Track is open. Use the app itself and your downloaded bug report to write your tests.</p>" +
+          '<p><a href="/">&larr; Back to app</a></p>' +
+          "</body>"
+      );
   }
-  let md = '# Spec unavailable';
+
+  let markdown = "# Spec unavailable";
+
   try {
-    md = require('fs').readFileSync(require('path').join(__dirname, 'README.md'), 'utf8');
-  } catch (e) {}
-  md = md.replace(/(https?:\/\/)?localhost:\d+/g, reqBaseUrl(req));
+    markdown = require("fs").readFileSync(
+      path.join(__dirname, "README.md"),
+      "utf8"
+    );
+  } catch (error) {
+    // Keep the fallback title when README.md is unavailable.
+  }
+
+  markdown = markdown.replace(
+    /(https?:\/\/)?localhost:\d+/g,
+    reqBaseUrl(req)
+  );
+
   res
-    .type('html')
+    .type("html")
     .send(
-      '<!doctype html><html><head><meta charset="utf-8">' +
+      "<!doctype html><html><head>" +
+        '<meta charset="utf-8">' +
         '<meta name="viewport" content="width=device-width,initial-scale=1">' +
-        '<title>Spec</title><style>' + SPEC_CSS + '</style></head>' +
-        '<body><div class="wrap"><a class="back" href="/">← Back to app</a>' +
-        renderMarkdown(md) +
-        '</div></body></html>'
+        "<title>Spec</title>" +
+        `<style>${SPEC_CSS}</style>` +
+        "</head><body>" +
+        '<div class="wrap">' +
+        '<a class="back" href="/">← Back to app</a>' +
+        renderMarkdown(markdown) +
+        "</div></body></html>"
     );
 });
 
-app.get('/openapi.json', (req, res) => {
+
+// ============================================================================
+// OpenAPI description
+// ============================================================================
+
+app.get("/openapi.json", (req, res) => {
   const doc = {
-    openapi: '3.0.3',
-    info: { title: 'Insufficiency Reminders API', version: '1.0.0' },
-    servers: [{ url: reqBaseUrl(req) }],
+    openapi: "3.0.3",
+
+    info: {
+      title: "Insufficiency Reminders API",
+      version: "1.0.0",
+    },
+
+    servers: [
+      {
+        url: reqBaseUrl(req),
+      },
+    ],
+
     paths: {
-      '/api/insufficiencies': {
+      "/api/insufficiencies": {
         get: {
-          summary: 'List insufficiencies, optionally filtered by status',
+          summary:
+            "List insufficiencies, optionally filtered by status",
+
           parameters: [
             {
-              name: 'status',
-              in: 'query',
+              name: "status",
+              in: "query",
               required: false,
-              schema: { type: 'string', enum: ['OPEN', 'RESOLVED'] }
-            }
+              schema: {
+                type: "string",
+                enum: ["OPEN", "RESOLVED"],
+              },
+            },
           ],
-          responses: { '200': { description: 'Array of insufficiency objects' } }
+
+          responses: {
+            "200": {
+              description:
+                "Array of insufficiency objects",
+            },
+          },
         },
+
         post: {
-          summary: 'Create a new OPEN insufficiency',
+          summary:
+            "Create a new OPEN insufficiency",
+
           requestBody: {
             required: true,
+
             content: {
-              'application/json': {
+              "application/json": {
                 schema: {
-                  type: 'object',
+                  type: "object",
+
                   properties: {
-                    candidateName: { type: 'string' },
-                    reason: { type: 'string' }
+                    candidateName: {
+                      type: "string",
+                    },
+
+                    reason: {
+                      type: "string",
+                    },
                   },
-                  required: ['candidateName', 'reason']
+
+                  required: [
+                    "candidateName",
+                    "reason",
+                  ],
                 },
-                example: { candidateName: 'Asha Rao', reason: 'Address proof unclear' }
-              }
-            }
+
+                example: {
+                  candidateName: "Asha Rao",
+                  reason:
+                    "Address proof unclear",
+                },
+              },
+            },
           },
-          responses: { '201': { description: 'The created insufficiency' } }
-        }
+
+          responses: {
+            "201": {
+              description:
+                "The created insufficiency",
+            },
+          },
+        },
       },
-      '/api/insufficiencies/{id}/remind': {
+
+      "/api/insufficiencies/{id}/remind": {
         post: {
-          summary: 'Send a reminder for an OPEN insufficiency (capped at 3)',
+          summary:
+            "Send a reminder for an OPEN insufficiency (capped at 3)",
+
           parameters: [
-            { name: 'id', in: 'path', required: true, schema: { type: 'integer' } }
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: {
+                type: "integer",
+              },
+            },
           ],
-          responses: { '200': { description: 'The updated insufficiency' } }
-        }
+
+          responses: {
+            "200": {
+              description:
+                "The updated insufficiency",
+            },
+          },
+        },
       },
-      '/api/insufficiencies/{id}/resolve': {
+
+      "/api/insufficiencies/{id}/resolve": {
         patch: {
-          summary: 'Mark an insufficiency RESOLVED',
+          summary:
+            "Mark an insufficiency RESOLVED",
+
           parameters: [
-            { name: 'id', in: 'path', required: true, schema: { type: 'integer' } }
+            {
+              name: "id",
+              in: "path",
+              required: true,
+              schema: {
+                type: "integer",
+              },
+            },
           ],
-          responses: { '200': { description: 'Array of all insufficiencies' } }
-        }
+
+          responses: {
+            "200": {
+              description:
+                "Array of all insufficiencies",
+            },
+          },
+        },
       },
-      '/api/reset': {
+
+      "/api/reset": {
         post: {
-          summary: 'Reset demo data to seed (utility, not part of the app under test)',
-          responses: { '200': { description: '{ ok: true }' } }
-        }
-      }
-    }
+          summary:
+            "Reset demo data to seed (utility, not part of the app under test)",
+
+          responses: {
+            "200": {
+              description: "{ ok: true }",
+            },
+          },
+        },
+      },
+    },
   };
+
   res.json(doc);
 });
 
-app.use((err, req, res, next) => {              // eslint-disable-line no-unused-vars
-  console.error('handler error:', (err && err.stack) || err);
-  if (!res.headersSent) res.status(500).json({ error: 'internal error' });
+
+// ============================================================================
+// Error handling
+// ============================================================================
+
+app.use((err, req, res, next) => {
+  console.error(
+    "handler error:",
+    (err && err.stack) || err
+  );
+
+  if (!res.headersSent) {
+    res.status(500).json({
+      error: "internal error",
+    });
+  }
 });
-process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
-process.on('uncaughtException', (e) => console.error('uncaughtException:', e));
+
+process.on("unhandledRejection", (error) => {
+  console.error("unhandledRejection:", error);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("uncaughtException:", error);
+});
+
+
+// ============================================================================
+// Start server
+// ============================================================================
 
 app.listen(PORT, () => {
-  console.log(`insufficiency-reminder listening on port ${PORT}`);
+  console.log(
+    `insufficiency-reminder listening on port ${PORT}`
+  );
 });
